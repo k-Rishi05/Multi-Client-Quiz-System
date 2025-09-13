@@ -18,7 +18,7 @@ int main(){
     serv_addr.sin_family= AF_INET;
     serv_addr.sin_port= htons(8080);    
 
-    if(inet_pton(AF_INET,"127.0.0.1",&serv_addr.sin_addr)<=0){
+    if(inet_pton(AF_INET,"192.168.50.111",&serv_addr.sin_addr)<=0){
         std::cout<<"Invalid address\n";
         return -1;
     }
@@ -32,20 +32,26 @@ int main(){
 
     std::cout<<"Connected to server\n";
 
-    int c=0;
-    while(c<10){
-        // Choose genre
-        std::string genre;
-        std::cout<<"Enter genre (history/computers/sports) or LEADERBOARD to view leaderboard\n";
-        std::getline(std::cin, genre);
-        send(sock,genre.c_str(),genre.size(),0);
+    // Receive prompt for genre
+    memset(buffer,0,sizeof(buffer));
+    read(sock,buffer,sizeof(buffer));
+    std::cout<<buffer;
 
-        // Receive question or if leaderboard requested
-        memset(buffer,0,sizeof(buffer)); // clean old data
-        read(sock,buffer,sizeof(buffer));
+    // Send genre once
+    std::string genre;
+    std::getline(std::cin, genre);
+    send(sock,genre.c_str(),genre.size(),0);
+
+    // Loop to receive and answer 10 questions
+    for(int i=0; i<10; ++i){
+        // Receive question
+        memset(buffer,0,sizeof(buffer));
+        int bytes_read = read(sock,buffer,sizeof(buffer));
+        if(bytes_read <= 0){
+            std::cout<<"Disconnected from server.\n";
+            break;
+        }
         std::cout<<buffer;
-
-        if(genre=="LEADERBOARD") continue;  // If leaderboard requested, skip to next iteration
 
         // Send answer
         std::string ans;
@@ -53,11 +59,16 @@ int main(){
         std::getline(std::cin, ans);
         send(sock,ans.c_str(),ans.size(),0);
 
-        memset(buffer,0,sizeof(buffer)); // clean old data
-        read(sock,buffer,sizeof(buffer));
+        // Receive feedback
+        memset(buffer,0,sizeof(buffer));
+        bytes_read = read(sock,buffer,sizeof(buffer));
+        if(bytes_read <= 0){
+            std::cout<<"Disconnected from server.\n";
+            break;
+        }
         std::cout<<buffer<<"\n";
-        c++;
     }
+
     close(sock);
     return 0;   
 }
