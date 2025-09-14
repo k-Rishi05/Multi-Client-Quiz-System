@@ -11,6 +11,10 @@
 #include <cstring>
 #include <sstream>
 #include <tuple>
+#include <chrono>
+#include <atomic>
+#include <iomanip>
+#include <set> 
 
 std::string reserve_llm(const std::string& rollno) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -47,7 +51,7 @@ std::string reserve_llm(const std::string& rollno) {
         response += buffer;
     }
     close(sock);
-
+    std:: cout<< "LLM Reserve Response: " << response << std::endl;
     // Strip HTTP headers. \r\n\r\n indicates end of headers after which CONTENT starts.
     // RETURN ONLY THE CONTENT
     size_t pos = response.find("\r\n\r\n");
@@ -108,23 +112,59 @@ std::string query_llm(const std::string& rollno, const std::string& genre) {
 std::mutex leaderboard_mutex;
 std::map<int, int> leaderboard; // username -> score
 
-std::string getLeaderboard(int client_id){
-    std::lock_guard<std::mutex> lock(leaderboard_mutex);
-    std::string msg="Leaderboard\n";
-    msg+="====================\n";
+// Track connected clients
+std::mutex active_clients_mutex;
+std::set<int> active_clients;
 
-    std::vector<std::pair<int,int> > score(leaderboard.begin(),leaderboard.end());
-    std::sort(score.begin(),score.end(),
-        [](auto &a,auto &b){
-            return a.second>b.second;
+// std::string getLeaderboard(int client_id){
+//     std::lock_guard<std::mutex> lock(leaderboard_mutex);
+//     std::string msg="Leaderboard\n";
+//     msg+="====================\n";
+
+//     std::vector<std::pair<int,int> > score(leaderboard.begin(),leaderboard.end());
+//     std::sort(score.begin(),score.end(),
+//         [](auto &a,auto &b){
+//             return a.second>b.second;
+//         });
+    
+//         for(auto& it:score){
+//             msg+=std::to_string(it.first)+" : "+std::to_string(it.second)+"\n";
+//         }
+//         msg+="====================\n";
+//         msg+="\nYour ID: "+std::to_string(client_id)+ "\n"+ "Your Score: "+std::to_string(leaderboard[client_id])+"\n\n";
+//         return msg;
+// }
+std::string getLeaderboard(int client_id, const std::set<int>& active_ids) {
+    std::lock_guard<std::mutex> lock(leaderboard_mutex);
+    std::stringstream msg;
+
+    msg << "\033[2J\033[H";
+    msg << "+---------------------------+\n";
+    msg << "|   ACTIVE LEADERBOARD      |\n";
+    msg << "+---------------------------+\n";
+    msg << "|   Player ID   |   Score   |\n";
+    msg << "+---------------------------+\n";
+
+    std::vector<std::pair<int, int>> score_vec(leaderboard.begin(), leaderboard.end());
+    std::sort(score_vec.begin(), score_vec.end(),
+        [](const auto& a, const auto& b) {
+            return a.second > b.second;
         });
     
-        for(auto& it:score){
-            msg+=std::to_string(it.first)+" : "+std::to_string(it.second)+"\n";
+    for (const auto& score : score_vec) {
+        // Only display the score if the client is in the active set.
+        if (active_ids.count(score.first)) {
+            msg << "| " << std::left << std::setw(13) << score.first
+                << "| " << std::left << std::setw(9) << score.second << " |";
+            if (score.first == client_id) {
+                msg << "  <-- YOU";
+            }
+            msg << "\n";
         }
-        msg+="====================\n";
-        msg+="\nYour ID: "+std::to_string(client_id)+ "\n"+ "Your Score: "+std::to_string(leaderboard[client_id])+"\n\n";
-        return msg;
+    }
+
+    msg << "+---------------------------+\n";
+    return msg.str();
 }
 
 // Returns vector of (question, options, answer)
@@ -222,68 +262,281 @@ std::string extract_content_field(const std::string& json) {
     return content;
 }
 
-void handle_client(int client_socket, int client_id){
-    char buffer[1024] = {0};
+// For KEEP-ALIVE mechanism
+void keep_alive_checker(int client_socket, int client_id, std::atomic<bool>& client_is_alive, std::atomic<std::chrono::steady_clock::time_point>& last_message_time) {
+    while (client_is_alive) {
+        // Wait for 5 seconds before the next check.
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        if (!client_is_alive) break;
 
-    // Ask for genre
+        // Check for timeout: if no message has been received for over 10 seconds.
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_message_time.load()).count();
+
+        if (elapsed > 10) {
+            std::cout << "[INFO] Client " << client_id << " timed out. Closing connection.\n";
+            client_is_alive = false;
+            // Closing the socket will cause the main thread's blocking read() to fail.
+            shutdown(client_socket, SHUT_RDWR);
+            close(client_socket);
+            break;
+        }
+
+        // Send the KEEP_ALIVE ping.
+        std::string ping = "KEEP_ALIVE\n";
+        if (send(client_socket, ping.c_str(), ping.size(), 0) <= 0) {
+            if (client_is_alive) { // Avoid double message if already closed
+                 std::cout << "[INFO] Client " << client_id << " disconnected (ping failed).\n";
+                 client_is_alive = false;
+                 shutdown(client_socket, SHUT_RDWR);
+                 close(client_socket);
+            }
+            break;
+        }
+    }
+}
+
+// Correct one
+// void handle_client(int client_socket, int client_id){
+
+//     char buffer[1024] = {0};
+//     auto start = std::chrono::steady_clock::now();
+
+//     // Ask for genre
+//     std::string prompt = "Enter quiz genre:\n";
+//     send(client_socket, prompt.c_str(), prompt.size(), 0);
+
+//     // Receive genre
+//     memset(buffer, 0, sizeof(buffer));
+//     int bytes_read = read(client_socket, buffer, sizeof(buffer));
+//     if (bytes_read <= 0) {
+//         std::cout << "Client disconnected before genre: " << client_socket << "\n";
+//         close(client_socket);
+//         return;
+//     }
+//     std::string genre(buffer);
+//     std::cout << "[DEBUG] Received genre: " << genre << std::endl;
+
+//     // Get quiz from LLM (as JSON string)
+//     std::string quiz_response = query_llm("es23btech11033", genre);
+//     std::cout << "[DEBUG] LLM raw response: " << quiz_response << std::endl;
+
+//     // Extract the quiz text from the JSON response
+//     std::string quiz_text = extract_content_field(quiz_response);
+//     std::cout << "[DEBUG] Extracted quiz text:\n" << quiz_text << std::endl;
+//     auto quiz = parse_json_quiz(quiz_text);
+//     std::cout << "[DEBUG] Parsed quiz size: " << quiz.size() << std::endl;
+//     if (quiz.empty()) {
+//         std::string error_msg = "Error generating quiz. Please try again.\n";
+//         send(client_socket, error_msg.c_str(), error_msg.size(), 0);
+//         close(client_socket);
+//         return;
+//     }
+
+//     // Send questions one by one
+//     for (const auto& [question, options, answer] : quiz) {
+
+//         // Check time limit (5 mins)
+//         auto now = std::chrono::steady_clock::now();
+//         auto elapsed = std::chrono::duration_cast<std::chrono::minutes>(now - start).count();
+//         if (elapsed >= 1) break;
+
+
+//         // Send question
+//         std::string q_text = question + "\n";
+//         for (const auto& opt : options) q_text += opt + "\n";
+//         send(client_socket, q_text.c_str(), q_text.size(), 0);
+
+//         // Receive answer
+//         memset(buffer, 0, sizeof(buffer));
+//         int ans_bytes = read(client_socket, buffer, sizeof(buffer));
+//         if (ans_bytes <= 0) break;
+//         std::string client_ans(buffer);
+
+//         // Feedback
+//         std::string msg;
+//         if (!client_ans.empty() && toupper(client_ans[0]) == answer) {
+//             msg = "Correct Answer!\n";
+//             std::lock_guard<std::mutex> guard(leaderboard_mutex);
+//             leaderboard[client_id]++;
+//         } else {
+//             msg = std::string("Wrong Answer! Correct answer is ") + answer + "\n";
+//         }
+//         send(client_socket, msg.c_str(), msg.size(), 0);
+
+//         sleep(3); // Wait for 3 seconds before next question
+//     }
+
+//     // After quiz ends or time limit reached
+//     std::string end_msg = "Quiz over – final scores available\n";
+//     end_msg += getLeaderboard(client_id);
+//     send(client_socket, end_msg.c_str(), end_msg.size(), 0);
+    
+//     close(client_socket);
+// }
+
+
+void handle_client(int client_socket, int client_id) {
+    char buffer[1024] = {0};
+    auto start = std::chrono::steady_clock::now();
+
+    // Ask for and receive genre (No watchdog needed here yet)
     std::string prompt = "Enter quiz genre:\n";
     send(client_socket, prompt.c_str(), prompt.size(), 0);
 
-    // Receive genre
     memset(buffer, 0, sizeof(buffer));
-    int bytes_read = read(client_socket, buffer, sizeof(buffer));
+    int bytes_read = read(client_socket, buffer, sizeof(buffer) - 1);
     if (bytes_read <= 0) {
-        std::cout << "Client disconnected before genre: " << client_socket << "\n";
+        std::cout << "Client disconnected before genre: " << client_id << "\n";
         close(client_socket);
         return;
     }
     std::string genre(buffer);
+    genre.erase(genre.find_last_not_of(" \n\r\t") + 1); // Keep the trim fix
     std::cout << "[DEBUG] Received genre: " << genre << std::endl;
 
-    // Get quiz from LLM (as JSON string)
+    // Get quiz from LLM - THIS IS THE LONG-RUNNING TASK
     std::string quiz_response = query_llm("es23btech11033", genre);
     std::cout << "[DEBUG] LLM raw response: " << quiz_response << std::endl;
-
-    // Extract the quiz text from the JSON response
     std::string quiz_text = extract_content_field(quiz_response);
     std::cout << "[DEBUG] Extracted quiz text:\n" << quiz_text << std::endl;
     auto quiz = parse_json_quiz(quiz_text);
-    std::cout << "[DEBUG] Parsed quiz size: " << quiz.size() << std::endl;
+    
     if (quiz.empty()) {
         std::string error_msg = "Error generating quiz. Please try again.\n";
         send(client_socket, error_msg.c_str(), error_msg.size(), 0);
         close(client_socket);
         return;
     }
+    //std::cout << "[DEBUG] Parsed quiz" << quiz.size() << std::endl;
+
+
+    // <<< CHANGE: START THE KEEP-ALIVE MECHANISM HERE, AFTER SETUP IS DONE >>>
+    std::atomic<bool> client_is_alive{true};
+    std::atomic<std::chrono::steady_clock::time_point> last_message_time;
+    last_message_time = std::chrono::steady_clock::now();
+    std::thread keep_alive_th(keep_alive_checker, client_socket, client_id, std::ref(client_is_alive), std::ref(last_message_time));
 
     // Send questions one by one
     for (const auto& [question, options, answer] : quiz) {
-        std::string q_text = question + "\n";
+        // Check if keep-alive thread detected a disconnect
+        if (!client_is_alive) break;
+
+        // Check time limit (5 mins)
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::minutes>(now - start).count();
+        if (elapsed >= 5) break; // Use 5 for a real quiz
+
+        // Send question (clear screen first for better UX)
+        std::string q_text = "\033[2J\033[H"+ question + "\n";
         for (const auto& opt : options) q_text += opt + "\n";
+        q_text += "\nChoose the correct option: ";
         send(client_socket, q_text.c_str(), q_text.size(), 0);
 
-        // Receive answer
-        memset(buffer, 0, sizeof(buffer));
-        int ans_bytes = read(client_socket, buffer, sizeof(buffer));
-        if (ans_bytes <= 0) break;
-        std::string client_ans(buffer);
+        // <<< CHANGE 4: Replace the simple read() with this intelligent loop >>>
+        std::string client_ans;
+        while (client_is_alive) {
+            memset(buffer, 0, sizeof(buffer));
+            int ans_bytes = read(client_socket, buffer, sizeof(buffer) - 1);
+            
+            if (ans_bytes <= 0) {
+                client_is_alive = false;
+                break;
+            }
+
+            last_message_time = std::chrono::steady_clock::now();
+            std::string received(buffer);
+            received.erase(received.find_last_not_of(" \n\r\t") + 1);
+
+            if (received == "ALIVE_OK") {
+                // Heartbeat received, continue waiting for the actual answer.
+                continue;
+            } else {
+                // Actual answer received, store it and break this waiting loop.
+                client_ans = received;
+                break;
+            }
+        }
+
+        // Exit the main quiz loop if the client has disconnected.
+        if (!client_is_alive) break;
 
         // Feedback
         std::string msg;
         if (!client_ans.empty() && toupper(client_ans[0]) == answer) {
-            msg = "Correct Answer!\n";
+            msg = "Correct Answer!\n\n";
             std::lock_guard<std::mutex> guard(leaderboard_mutex);
             leaderboard[client_id]++;
         } else {
-            msg = std::string("Wrong Answer! Correct answer is ") + answer + "\n";
+            msg = std::string("Wrong Answer! Correct answer is ") + answer + "\n\n";
         }
         send(client_socket, msg.c_str(), msg.size(), 0);
 
-        sleep(3); // Wait for 3 seconds before next question
+        //sleep(2); // A small delay before the next question is fine.
+
+        std::string prompt = "\nPress [L] for Leaderboard, or [Enter] for Next Question: ";
+        send(client_socket, prompt.c_str(), prompt.size(), 0);
+
+        std::string choice;
+        while (client_is_alive) {
+            memset(buffer, 0, sizeof(buffer));
+            int choice_bytes = read(client_socket, buffer, sizeof(buffer) - 1);
+            if (choice_bytes <= 0) { client_is_alive = false; break; }
+            last_message_time = std::chrono::steady_clock::now();
+            std::string received(buffer, choice_bytes);
+            received.erase(received.find_last_not_of(" \n\r\t") + 1);
+            if (received != "ALIVE_OK") {
+                choice = received;
+                break; // Got the real choice, exit loop
+            }
+            // If it was ALIVE_OK, loop and read again
+        }
+        if (!client_is_alive) break;
+
+        if (choice == "L" || choice == "l") {
+            std::string board;
+            { // Lock active_clients to safely read it
+                std::lock_guard<std::mutex> lock(active_clients_mutex);
+                board = getLeaderboard(client_id, active_clients);
+            }
+            send(client_socket, board.c_str(), board.size(), 0);
+            
+            // Wait for user to press Enter to continue
+            std::string continue_prompt = "\n--- Leaderboard Displayed ---\nPress [Enter] to continue...";
+            send(client_socket, continue_prompt.c_str(), continue_prompt.size(), 0);
+            while (client_is_alive) {
+                memset(buffer, 0, sizeof(buffer));
+                int enter_bytes = read(client_socket, buffer, sizeof(buffer) - 1);
+                if (enter_bytes <= 0) { client_is_alive = false; break; }
+                last_message_time = std::chrono::steady_clock::now();
+                std::string received(buffer, enter_bytes);
+                received.erase(received.find_last_not_of(" \n\r\t") + 1);
+                if (received != "ALIVE_OK") {
+                    break; // Got the Enter key, exit loop
+                }
+            }
+        }
     }
 
-    close(client_socket);
+    // After quiz ends or time limit reached
+    if (client_is_alive) {
+        std::string end_msg = "Quiz over – final scores available\n";
+        end_msg += getLeaderboard(client_id, active_clients);
+        send(client_socket, end_msg.c_str(), end_msg.size(), 0);
+    }
+    
+    // <<< CHANGE 5: Cleanly shut down the keep-alive thread >>>
+    client_is_alive = false; // Signal the thread to exit its loop
+    keep_alive_th.join();    // Wait for the thread to finish
+    
+    // Now that the session is truly over, remove the client from the active set.
+    {
+        std::lock_guard<std::mutex> lock(active_clients_mutex);
+        active_clients.erase(client_id);
+    }
+    std::cout << "[INFO] Client " << client_id << " session finished and resources cleaned up.\n";
 }
+
 
 int main(){
     
@@ -325,7 +578,12 @@ int main(){
             std::cout<<"Accepting failed\n";
             return -1;
         }
-        std::cout<<"Client connected :"<<new_socket<<"\n";
+        std::cout << "Client connected: " << new_socket << " with ID: " << client_id << "\n";
+        // Add the new client to the active set
+        {
+            std::lock_guard<std::mutex> lock(active_clients_mutex);
+            active_clients.insert(client_id);
+        }
         std::thread t(handle_client,new_socket,client_id++);
         t.detach(); // Detach to run thread for each client
     }
