@@ -278,12 +278,23 @@ void keep_alive_checker(int client_socket, int client_id, std::atomic<bool>& cli
     }
 }
 
+// Represents a single cached quiz
+struct CacheEntry {
+    std::vector<std::tuple<std::string, std::vector<std::string>, char>> quiz_data;
+    std::chrono::steady_clock::time_point creation_time;
+};
+
+// The main cache: maps a genre string to its CacheEntry
+std::map<std::string, CacheEntry> quiz_cache;
+std::mutex cache_mutex;
+// Define the Time-To-Live for cache entries in minutes.
+const int TTL_MINUTES = 10;
 
 void handle_client(int client_socket, int client_id) {
     char buffer[1024] = {0};
     auto start = std::chrono::steady_clock::now();
 
-    // Ask for and receive genre (No watchdog needed here yet)
+    // Ask for and receive genre
     std::string prompt = "Enter quiz genre:\n";
     send(client_socket, prompt.c_str(), prompt.size(), 0);
 
@@ -295,48 +306,96 @@ void handle_client(int client_socket, int client_id) {
         return;
     }
     std::string genre(buffer);
-    genre.erase(genre.find_last_not_of(" \n\r\t") + 1); // Keep the trim fix
-    std::cout << "[DEBUG] Received genre: " << genre << std::endl;
-
-    // Get quiz from LLM - THIS IS THE LONG-RUNNING TASK
-    std::string quiz_response = query_llm("es23btech11033", genre);
-    std::cout << "[DEBUG] LLM raw response: " << quiz_response << std::endl;
-    std::string quiz_text = extract_content_field(quiz_response);
-    std::cout << "[DEBUG] Extracted quiz text:\n" << quiz_text << std::endl;
-    auto quiz = parse_json_quiz(quiz_text);
+    genre.erase(genre.find_last_not_of(" \n\r\t") + 1);
     
+    // Vector to hold the final quiz questions, either from cache or new
+    std::vector<std::tuple<std::string, std::vector<std::string>, char>> quiz;
+    bool served_from_cache = false;
+
+    // --- START CACHE CHECK ---
+    { // Use a block to scope the lock_guard
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        auto it = quiz_cache.find(genre);
+
+        if (it != quiz_cache.end()) {
+            // Entry exists, now check if it's stale by comparing its age to TTL
+            auto age = std::chrono::duration_cast<std::chrono::minutes>(
+                std::chrono::steady_clock::now() - it->second.creation_time
+            ).count();
+
+            if (age < TTL_MINUTES) {
+                // CACHE HIT: Entry is valid and not stale
+                std::cout << "[INFO] Cache hit for genre: '" << genre << "'. Serving from cache.\n";
+                quiz = it->second.quiz_data; // Copy data from cache
+                served_from_cache = true;
+            }
+        }
+    } // Mutex is automatically unlocked here
+
+    if (!served_from_cache) {
+        // CACHE MISS: Entry does not exist or is stale. Fetch from LLM.
+        // The mutex is NOT held during this slow network operation.
+        std::cout << "[INFO] Cache miss for genre: '" << genre << "'. Fetching from LLM.\n";
+
+        std::string quiz_response = query_llm("es23btech11033", genre);
+        std::string quiz_text = extract_content_field(quiz_response);
+        quiz = parse_json_quiz(quiz_text);
+
+        // If we got a valid quiz, add it to the cache
+        if (!quiz.empty()) {
+            std::lock_guard<std::mutex> lock(cache_mutex); // Lock again to write to the cache
+            CacheEntry new_entry;
+            new_entry.quiz_data = quiz;
+            new_entry.creation_time = std::chrono::steady_clock::now();
+            quiz_cache[genre] = new_entry;
+            std::cout << "[INFO] Genre '" << genre << "' added to cache.\n";
+        }
+    }
+    // --- END CACHE LOGIC ---
+
     if (quiz.empty()) {
-        std::string error_msg = "Error generating quiz. Please try again.\n";
+        std::string error_msg = "Error generating or finding quiz for this genre. Please try another.\n";
         send(client_socket, error_msg.c_str(), error_msg.size(), 0);
         close(client_socket);
         return;
     }
-    //std::cout << "[DEBUG] Parsed quiz" << quiz.size() << std::endl;
 
-
-    // <<< CHANGE: START THE KEEP-ALIVE MECHANISM HERE, AFTER SETUP IS DONE >>>
     std::atomic<bool> client_is_alive{true};
     std::atomic<std::chrono::steady_clock::time_point> last_message_time;
     last_message_time = std::chrono::steady_clock::now();
     std::thread keep_alive_th(keep_alive_checker, client_socket, client_id, std::ref(client_is_alive), std::ref(last_message_time));
 
     // Send questions one by one
-    for (const auto& [question, options, answer] : quiz) {
-        // Check if keep-alive thread detected a disconnect
+    for (const auto& [question, options, answer_char] : quiz) {
         if (!client_is_alive) break;
 
-        // Check time limit (5 mins)
         auto now = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::minutes>(now - start).count();
-        if (elapsed >= 5) break; // Use 5 for a real quiz
+        if (elapsed >= 5) break;
 
-        // Send question (clear screen first for better UX)
-        std::string q_text = "\033[2J\033[H"+ question + "\n";
-        for (const auto& opt : options) q_text += opt + "\n";
+        // Prepend [CACHE] or [FRESH] tag to the question
+        std::string cache_prefix = served_from_cache ? "[CACHE] " : "[FRESH] ";
+        std::string q_text = "\033[2J\033[H" + cache_prefix + question + "\n";
+        
+        char option_label = 'A';
+        for (const auto& opt : options) {
+            // Trim leading whitespace from the option
+            size_t first_char = opt.find_first_not_of(" \t");
+            std::string trimmed_opt = (first_char == std::string::npos) ? opt : opt.substr(first_char);
+
+            // Check if the option is already formatted (e.g., starts with "A)")
+            if (trimmed_opt.length() >= 2 && isalpha(trimmed_opt[0]) && trimmed_opt[1] == ')') {
+                q_text += trimmed_opt + "\n"; // If yes, use it directly
+            } else {
+                q_text += option_label;      // If no, add our own label
+                q_text += ") ";
+                q_text += opt + "\n";
+            }
+            option_label++;
+        }
         q_text += "\nChoose the correct option: ";
         send(client_socket, q_text.c_str(), q_text.size(), 0);
 
-        // <<< CHANGE 4: Replace the simple read() with this intelligent loop >>>
         std::string client_ans;
         while (client_is_alive) {
             memset(buffer, 0, sizeof(buffer));
@@ -352,30 +411,24 @@ void handle_client(int client_socket, int client_id) {
             received.erase(received.find_last_not_of(" \n\r\t") + 1);
 
             if (received == "ALIVE_OK") {
-                // Heartbeat received, continue waiting for the actual answer.
                 continue;
             } else {
-                // Actual answer received, store it and break this waiting loop.
                 client_ans = received;
                 break;
             }
         }
 
-        // Exit the main quiz loop if the client has disconnected.
         if (!client_is_alive) break;
 
-        // Feedback
         std::string msg;
-        if (!client_ans.empty() && toupper(client_ans[0]) == answer) {
+        if (!client_ans.empty() && toupper(client_ans[0]) == answer_char) {
             msg = "Correct Answer!\n\n";
             std::lock_guard<std::mutex> guard(leaderboard_mutex);
             leaderboard[client_id]++;
         } else {
-            msg = std::string("Wrong Answer! Correct answer is ") + answer + "\n\n";
+            msg = "Wrong Answer! Correct answer is " + std::string(1, answer_char) + "\n\n";
         }
         send(client_socket, msg.c_str(), msg.size(), 0);
-
-        //sleep(2); // A small delay before the next question is fine.
 
         std::string prompt = "\nPress [L] for Leaderboard, or [Enter] for Next Question: ";
         send(client_socket, prompt.c_str(), prompt.size(), 0);
@@ -390,21 +443,19 @@ void handle_client(int client_socket, int client_id) {
             received.erase(received.find_last_not_of(" \n\r\t") + 1);
             if (received != "ALIVE_OK") {
                 choice = received;
-                break; // Got the real choice, exit loop
+                break;
             }
-            // If it was ALIVE_OK, loop and read again
         }
         if (!client_is_alive) break;
 
         if (choice == "L" || choice == "l") {
             std::string board;
-            { // Lock active_clients to safely read it
+            {
                 std::lock_guard<std::mutex> lock(active_clients_mutex);
                 board = getLeaderboard(client_id, active_clients);
             }
             send(client_socket, board.c_str(), board.size(), 0);
             
-            // Wait for user to press Enter to continue
             std::string continue_prompt = "\n--- Leaderboard Displayed ---\nPress [Enter] to continue...";
             send(client_socket, continue_prompt.c_str(), continue_prompt.size(), 0);
             while (client_is_alive) {
@@ -415,31 +466,27 @@ void handle_client(int client_socket, int client_id) {
                 std::string received(buffer, enter_bytes);
                 received.erase(received.find_last_not_of(" \n\r\t") + 1);
                 if (received != "ALIVE_OK") {
-                    break; // Got the Enter key, exit loop
+                    break;
                 }
             }
         }
     }
 
-    // After quiz ends or time limit reached
     if (client_is_alive) {
         std::string end_msg = "Quiz over – final scores available\n";
         end_msg += getLeaderboard(client_id, active_clients);
         send(client_socket, end_msg.c_str(), end_msg.size(), 0);
     }
     
-    // <<< CHANGE 5: Cleanly shut down the keep-alive thread >>>
-    client_is_alive = false; // Signal the thread to exit its loop
-    keep_alive_th.join();    // Wait for the thread to finish
+    client_is_alive = false;
+    keep_alive_th.join();
     
-    // Now that the session is truly over, remove the client from the active set.
     {
         std::lock_guard<std::mutex> lock(active_clients_mutex);
         active_clients.erase(client_id);
     }
     std::cout << "[INFO] Client " << client_id << " session finished and resources cleaned up.\n";
 }
-
 
 int main(){
     
@@ -457,10 +504,12 @@ int main(){
     memset(&address,0,sizeof(address));
     address.sin_family= AF_INET;
     address.sin_addr.s_addr= INADDR_ANY;
-    address.sin_port= htons(8080);
+    address.sin_port= htons(13033);
 
     if(bind(server_fd,(struct sockaddr*)&address,sizeof(address))<0){
-        std::cout<<"Binding failed\n";
+        // std::cout<<"Binding failed\n";
+        // return -1;
+        perror("Binding failed");
         return -1;
     }
     std::cout<<"Binding successful\n";
@@ -493,3 +542,4 @@ int main(){
 
     return 0;
 }
+
